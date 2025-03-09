@@ -13,8 +13,20 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <wifi_station.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/timers.h>
 
 #define TAG "atk_dnesp32s3"
+
+// 定义 K1 和 K2 按键对应的 XL9555 IO 引脚
+#define K1_IO_PIN 5  // XL9555 的 IOQ_5 引脚
+#define K2_IO_PIN 4  // XL9555 的 IOQ_4 引脚
+
+// 音量控制参数
+#define VOLUME_STEP 5  // 每次按键音量变化步长
+#define MIN_VOLUME 0   // 最小音量
+#define MAX_VOLUME 100 // 最大音量
 
 LV_FONT_DECLARE(font_puhui_20_4);
 LV_FONT_DECLARE(font_awesome_20_4);
@@ -43,15 +55,95 @@ public:
             WriteReg(0x03, data);
         }
     }
+    
+    // 读取输入引脚状态
+    bool GetInputState(uint8_t bit) {
+        uint8_t data;
+        if (bit < 8) {
+            data = ReadReg(0x00);
+        } else {
+            data = ReadReg(0x01);
+            bit -= 8;
+        }
+        
+        return (data & (1 << bit)) == 0; // 按键按下时为低电平
+    }
 };
 
+// 自定义 XL9555 按键类
+class XL9555Button {
+private:
+    XL9555* xl9555_;
+    uint8_t io_pin_;
+    bool last_state_ = false;
+    TimerHandle_t debounce_timer_ = nullptr;
+    
+    std::function<void()> on_press_down_;
+    std::function<void()> on_press_up_;
+    std::function<void()> on_click_;
+    
+    static void DebounceTimerCallback(TimerHandle_t timer) {
+        XL9555Button* button = static_cast<XL9555Button*>(pvTimerGetTimerID(timer));
+        button->CheckButtonState();
+    }
+    
+    void CheckButtonState() {
+        bool current_state = xl9555_->GetInputState(io_pin_);
+        
+        if (current_state != last_state_) {
+            last_state_ = current_state;
+            
+            if (current_state) { // 按键按下
+                if (on_press_down_) {
+                    on_press_down_();
+                }
+            } else { // 按键释放
+                if (on_press_up_) {
+                    on_press_up_();
+                }
+                if (on_click_) {
+                    on_click_();
+                }
+            }
+        }
+    }
+    
+public:
+    XL9555Button(XL9555* xl9555, uint8_t io_pin) : xl9555_(xl9555), io_pin_(io_pin) {
+        // 创建按键检测定时器，每 50ms 检测一次按键状态
+        debounce_timer_ = xTimerCreate("btn_timer", pdMS_TO_TICKS(50), pdTRUE, this, DebounceTimerCallback);
+        xTimerStart(debounce_timer_, 0);
+    }
+    
+    ~XL9555Button() {
+        if (debounce_timer_) {
+            xTimerStop(debounce_timer_, 0);
+            xTimerDelete(debounce_timer_, 0);
+        }
+    }
+    
+    void OnPressDown(std::function<void()> callback) {
+        on_press_down_ = callback;
+    }
+    
+    void OnPressUp(std::function<void()> callback) {
+        on_press_up_ = callback;
+    }
+    
+    void OnClick(std::function<void()> callback) {
+        on_click_ = callback;
+    }
+};
 
 class atk_dnesp32s3 : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
+    XL9555Button* k1_button_ = nullptr;
+    XL9555Button* k2_button_ = nullptr;
     LcdDisplay* display_;
     XL9555* xl9555_;
+    int current_volume_ = 70; // 默认音量
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -86,6 +178,7 @@ private:
     }
 
     void InitializeButtons() {
+        // 初始化 BOOT 按键
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
@@ -98,6 +191,52 @@ private:
         boot_button_.OnPressUp([this]() {
             Application::GetInstance().StopListening();
         });
+        
+        // 初始化 K1 按键 (音量+)
+        k1_button_ = new XL9555Button(xl9555_, K1_IO_PIN);
+        k1_button_->OnClick([this]() {
+            IncreaseVolume();
+        });
+        
+        // 初始化 K2 按键 (音量-)
+        k2_button_ = new XL9555Button(xl9555_, K2_IO_PIN);
+        k2_button_->OnClick([this]() {
+            DecreaseVolume();
+        });
+    }
+    
+    // 增加音量
+    void IncreaseVolume() {
+        current_volume_ += VOLUME_STEP;
+        if (current_volume_ > MAX_VOLUME) {
+            current_volume_ = MAX_VOLUME;
+        }
+        
+        ESP_LOGI(TAG, "Volume increased to: %d", current_volume_);
+        GetAudioCodec()->SetOutputVolume(current_volume_);
+        
+        // 可以在这里添加显示音量的代码
+        if (display_) {
+            // 显示音量信息
+            // display_->ShowVolume(current_volume_);
+        }
+    }
+    
+    // 减小音量
+    void DecreaseVolume() {
+        current_volume_ -= VOLUME_STEP;
+        if (current_volume_ < MIN_VOLUME) {
+            current_volume_ = MIN_VOLUME;
+        }
+        
+        ESP_LOGI(TAG, "Volume decreased to: %d", current_volume_);
+        GetAudioCodec()->SetOutputVolume(current_volume_);
+        
+        // 可以在这里添加显示音量的代码
+        if (display_) {
+            // 显示音量信息
+            // display_->ShowVolume(current_volume_);
+        }
     }
 
     void InitializeSt7789Display() {
@@ -154,6 +293,18 @@ public:
         InitializeSt7789Display();
         InitializeButtons();
         InitializeIot();
+    }
+    
+    ~atk_dnesp32s3() {
+        if (k1_button_) {
+            delete k1_button_;
+        }
+        if (k2_button_) {
+            delete k2_button_;
+        }
+        if (xl9555_) {
+            delete xl9555_;
+        }
     }
 
     virtual Led* GetLed() override {
